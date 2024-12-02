@@ -1,0 +1,182 @@
+#!/bin/bash
+# Author: Daniela D. Russo <danieladrusso@gmail.com>
+#
+# Allows for the passing of one or more samples that have been processed via the GATK preprocessing workflow. SNPs will be called using the HaplotypeCaller pipeline as explained here: https://gatk.broadinstitute.org/hc/en-us/articles/360037225632-HaplotypeCaller
+# Samples are processed individually, in parallel
+#
+set -e
+set -o pipefail
+
+# Initialize logging
+LOG_FILE="haplotypecaller_pipeline.log"
+CHECKPOINT_FILE=".haplotypecaller_checkpoint"
+
+# Function for logging
+log() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] $1" | tee -a "${LOG_FILE}"
+}
+
+# Function to show usage
+usage() {
+    echo "Usage: $0 [options]"
+    echo
+    echo "Required arguments:"
+    echo "  -s sample1 [sample2 sample3 ...]   Specify one or more sample names"
+    echo "  -b INPUT_BAM                       List of preprocessed BAM files"
+    echo "  -i INPUT_BAM_INDEX                 List of preprocessed BAM index files"    
+    echo "  -r REF_FASTA                       Reference FASTA file"
+    echo "  -x REF_FASTA_INDEX                 Reference FASTA index file"
+    echo "  -d REF_DICT                        Reference dictionary file"
+    echo "  -v DBSNP_VCF                       dbSNP VCF file"
+    echo "  -n DBSNP_VCF_INDEX                 dbSNP VCF index file"
+    echo "  -l INTERVAL_LIST                   VCF file with known indels sites"
+    echo "  -o OUTPUT_DIR                      Directory for output files"
+    echo
+    echo "Optional arguments:"
+    echo "  -h                                 Display this help message"
+    echo "  -g                                 Generate GVCF instead of VCF"   
+    echo
+    exit 1
+}
+
+# Parse command line arguments
+MAKE_GVCF=false
+declare -a SAMPLE_NAMES
+
+while getopts ":s:b:i:r:x:d:v:n:l:o:g" opt; do
+    case $opt in
+        s) 
+            # Handle multiple sample names
+            for sample in ${OPTARG}; do
+                SAMPLE_NAMES+=("$sample")
+            done
+            ;;
+        b) INPUT_BAM="$OPTARG" ;;
+        i) INPUT_BAM_INDEX="$OPTARG" ;;
+        r) REF_FASTA="$OPTARG" ;;
+        x) REF_FASTA_INDEX="$OPTARG" ;;
+        d) REF_DICT="$OPTARG" ;;
+        v) DBSNP_VCF="$OPTARG" ;;
+        n) DBSNP_VCF_INDEX="$OPTARG" ;;
+        l) INTERVAL_LIST="$OPTARG" ;;
+        o) OUTPUT_DIR="$OPTARG" ;;
+        g) MAKE_GVCF=true ;;
+        \?) echo "Invalid option: -$OPTARG" >&2; usage ;;
+        :) echo "Option -$OPTARG requires an argument." >&2; usage ;;
+    esac
+done
+
+# Configuration variables
+GATK="/gatk/gatk"
+COMPRESSION_LEVEL=5
+
+# Function to run HaplotypeCaller
+run_haplotypecaller() {
+    local sample_name=$1
+    local interval=$2
+    local output_basename=$3
+    local output_suffix
+    
+    if [[ "$MAKE_GVCF" == true ]]; then
+        output_suffix=".g.vcf.gz"
+    else
+        output_suffix=".vcf.gz"
+    fi
+    
+    local output_vcf="${output_basename}${output_suffix}"
+    
+    log "Running HaplotypeCaller for sample ${sample_name} on interval ${interval}"
+    
+    ${GATK} --java-options "-Xmx4G" \
+        HaplotypeCaller \
+        -R "${REF_FASTA}" \
+        -I "${INPUT_BAM}" \
+        -L "${interval}" \
+        -O "${output_vcf}" \
+        --dbsnp "${DBSNP_VCF}" \
+        -G StandardAnnotation \
+        -G StandardHCAnnotation \
+        -GQB 10 -GQB 20 -GQB 30 -GQB 40 -GQB 50 \
+        -GQB 60 -GQB 70 -GQB 80 -GQB 90 \
+        ${MAKE_GVCF:+-ERC GVCF}
+        
+    log "Completed HaplotypeCaller for sample ${sample_name} on interval ${interval}"
+}
+
+# Function to merge VCFs
+merge_vcfs() {
+    local sample_name=$1
+    local output_basename=$2
+    local vcf_list=$3
+    local output_suffix
+    
+    if [[ "$MAKE_GVCF" == true ]]; then
+        output_suffix=".g.vcf.gz"
+    else
+        output_suffix=".vcf.gz"
+    fi
+    
+    log "Merging VCFs for sample ${sample_name}"
+    
+    ${GATK} --java-options "-Xmx4G" \
+        MergeVcfs \
+        --INPUT ${vcf_list} \
+        --OUTPUT "${output_basename}${output_suffix}"
+        
+    log "Completed merging VCFs for sample ${sample_name}"
+}
+
+# Function to process a single sample
+process_sample() {
+    local sample_name=$1
+    local output_dir="${OUTPUT_DIR}/${sample_name}"
+    mkdir -p "${output_dir}"
+    
+    log "Processing sample: ${sample_name}"
+    
+    # Create temporary directory for interval VCFs
+    local temp_dir="${output_dir}/temp"
+    mkdir -p "${temp_dir}"
+    
+    # Process each interval in parallel
+    local interval_vcfs=""
+    while IFS= read -r interval; do
+        local interval_name=$(echo "${interval}" | sed 's/[^a-zA-Z0-9]/_/g')
+        local interval_vcf="${temp_dir}/${sample_name}.${interval_name}.vcf.gz"
+        run_haplotypecaller "${sample_name}" "${interval}" "${interval_vcf}" &
+        interval_vcfs="${interval_vcfs} ${interval_vcf}"
+    done < "${INTERVAL_LIST}"
+    
+    # Wait for all parallel processes to complete
+    wait
+    
+    # Merge all interval VCFs
+    merge_vcfs "${sample_name}" "${output_dir}/${sample_name}" "${interval_vcfs}"
+    
+    # Cleanup temporary files
+    rm -rf "${temp_dir}"
+    
+    log "Completed processing for sample: ${sample_name}"
+}
+
+# Main execution
+main() {
+    # Create output directory
+    mkdir -p "${OUTPUT_DIR}"
+    
+    log "Starting HaplotypeCaller pipeline for ${#SAMPLE_NAMES[@]} samples"
+    
+    # Process each sample in parallel
+    for sample_name in "${SAMPLE_NAMES[@]}"; do
+        process_sample "${sample_name}" &
+    done
+    
+    # Wait for all samples to complete
+    wait
+    
+    log "Pipeline completed for all samples"
+}
+
+# Execute main workflow
+main "$@"
