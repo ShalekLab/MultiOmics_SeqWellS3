@@ -35,7 +35,7 @@ run_CITESeq_Counts_HTO() {
     sample=$1
     idx=$2
 
-    celln=$(cat "./starsolo/${sample}/Solo.out/Gene/filtered/barcodes.tsv" | wc -l)
+    celln=$(cat "./${sample}/Solo.out/Gene/filtered/barcodes.tsv" | wc -l)
 
     # Determine the HTO file to use
     if [ -f "HTO_${sample}.csv" ]; then
