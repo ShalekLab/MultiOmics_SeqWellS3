@@ -26,7 +26,7 @@
 # Running the script 
 # For HTO only: ./run_CITESeq_Counts.sh HTO "sample1 sample2" "idx1 idx2"
 # For ADT only: ./run_CITESeq_Counts.sh ADT "sample1 sample2" "idx1 idx2"
-# For both HTO and ADT: ./run_CITESeq_Counts.sh Both "sample1_HTO sample2_HTO" "idx1_HTO idx2_HTO" "sample1_ADT sample2_ADT" "idx1_ADT idx2_ADT"
+# For both HTO and ADT: ./run_CITESeq_Counts.sh Both "sample1 sample2" "idx1_HTO idx2_HTO" "idx1_ADT idx2_ADT"
 
 ##
 
@@ -102,8 +102,8 @@ process_input() {
     elif [ "$type" == "Both" ]; then
         IFS=' ' read -r -a samples_HTO <<< "$1"
         IFS=' ' read -r -a idxs_HTO <<< "$2"
-        IFS=' ' read -r -a samples_ADT <<< "$3"
-        IFS=' ' read -r -a idxs_ADT <<< "$4"
+        IFS=' ' read -r -a samples_ADT <<< "$1"
+        IFS=' ' read -r -a idxs_ADT <<< "$3"
         for i in "${!samples_HTO[@]}"; do
             run_CITESeq_Counts_HTO "${samples_HTO[i]}" "${idxs_HTO[i]}"
         done
