@@ -1,0 +1,284 @@
+#!/bin/bash
+#
+# Author: Daniela D. Russo <danieladrusso@gmail.com>
+#
+# Allows for the passing of one or more unmapped sample BAM files to be passed. Samples will undergo each step of GATK preprocessing for variant discovery as outlined here: https://gatk.broadinstitute.org/hc/en-us/articles/360035535912-Data-pre-processing-for-variant-discovery
+# Samples are processed individually, in parallel
+#
+# Enable error tracing and exit on error
+set -e
+set -o pipefail
+
+# Error handling function
+handle_error() {
+    local sample_name=$1
+    local error_message=$2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: ${error_message}" >> "${sample_name}_pipeline.log"
+    exit 1
+}
+
+# Set the trap for error handling
+trap 'handle_error "${sample_name}" "Command failed with exit code $?"' ERR
+
+# Logging function
+log_message() {
+    local sample_name=$1
+    local message=$2
+    local log_file="${sample_name}_pipeline.log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${message}" | tee -a "${log_file}"
+}
+
+# Checkpoint management function
+update_checkpoint() {
+    local sample_name=$1
+    local checkpoint=$2
+    local checkpoint_file="${sample_name}_checkpoint"
+    echo "${checkpoint}" > "${checkpoint_file}"
+    log_message "${sample_name}" "Checkpoint updated to: ${checkpoint}"
+}
+
+# Required functions
+# Function to process a single sample
+process_sample() {
+    local sample_name=$1
+    local base_filename="${sample_name}.${REF_NAME}"
+    
+    # Get current checkpoint or start new
+    local current_checkpoint="start"
+    local checkpoint_file="${sample_name}_checkpoint"
+    if [[ -f "${checkpoint_file}" ]]; then
+        current_checkpoint=$(cat "${checkpoint_file}")
+        log_message "${sample_name}" "Resuming from checkpoint: ${current_checkpoint}"
+    fi
+    
+    #Alignment
+    if [[ "$current_checkpoint" == "setup_complete" || "$current_checkpoint" == "start" ]]; then
+        log_message "${sample_name}" "Starting alignment step"
+    
+        local output_bam="${sample_name}.unmerged.bam"
+    
+        java -Dsamjdk.compression_level=5 -Xmx7G -jar ${PICARD_PATH} \
+        SamToFastq \
+            --INPUT ${sample_name}.unmapped.bam \
+            --FASTQ ${sample_name}.fastq \
+            --INTERLEAVE true \
+            --NON_PF true \
+        | \
+        ${BWAKIT_PATH}/run-bwamem mem -K 100000000 -p -v 3 -t 16 -Y ${REF_FASTA} ${sample_name}.fastq \
+            2> ${sample_name}.bwa.stderr.log \
+        | \
+        samtools view -1 ${sample_name}.fastq > "$output_bam"
+    
+        log_message "${sample_name}" "Completed alignment step"
+        update_checkpoint "${sample_name}" "alignment_complete"
+    fi
+    
+    # Merge alignment
+    echo "Merge alignment step"
+    if [[ "$current_checkpoint" == "alignment_complete" || "$current_checkpoint" == "start" ]]; then
+        log_message "${sample_name}" "Starting merge alignment step"
+        java -Dsamjdk.compression_level=5 -Xmx7G -jar ${PICARD_PATH} \
+        MergeBamAlignment \
+            --VALIDATION_STRINGENCY SILENT \
+            --EXPECTED_ORIENTATIONS FR \
+            --ATTRIBUTES_TO_RETAIN X0 \
+            --ALIGNED_BAM "${base_filename}unmerged.bam" \
+            --UNMAPPED_BAM "${sample_name}.unmapped.bam" \
+            --OUTPUT "${base_filename}aligned.unsorted.bam" \
+            --REFERENCE_SEQUENCE ${REF_FASTA} \
+            --PAIRED_RUN true \
+            --SORT_ORDER "unsorted" \
+            --IS_BISULFITE_SEQUENCE false \
+            --ALIGNED_READS_ONLY false \
+            --CLIP_ADAPTERS false \
+            --MAX_RECORDS_IN_RAM 2000000 \
+            --ADD_MATE_CIGAR true \
+            --MAX_INSERTIONS_OR_DELETIONS -1 \
+            --PRIMARY_ALIGNMENT_STRATEGY MostDistant \
+            --PROGRAM_RECORD_ID "bwamem" \
+            --PROGRAM_GROUP_VERSION "0.7.18-r1243-dirty" \
+            --PROGRAM_GROUP_COMMAND_LINE "bwa" \
+            --PROGRAM_GROUP_NAME "bwamem" \
+            --UNMAPPED_READ_STRATEGY COPY_TO_TAG \
+            --ALIGNER_PROPER_PAIR_FLAGS true \
+            --UNMAP_CONTAMINANT_READS true
+        update_checkpoint "${sample_name}" "merged_bam_alignment"
+    fi
+
+    # Mark duplicates
+    if [[ "$current_checkpoint" == "sorted_fixed_tags" || "$current_checkpoint" == "start" ]]; then
+        log_message "${sample_name}" "Starting mark duplicate step"
+        local input_bam="${base_filename}aligned.unsorted.bam"
+        local output_bam="${base_filename}aligned.unsorted.duplicate_marked.sorted.bam"
+        local metrics_filename="${base_filename}duplicate_metrics"
+
+        java -Dsamjdk.compression_level=5 -Xmx7G -jar ${PICARD_PATH}  \
+            MarkDuplicates \
+            --INPUT "${input_bam}" \
+            --OUTPUT "${output_bam}" \
+            --METRICS_FILE ${metrics_filename} \
+            --VALIDATION_STRINGENCY SILENT \
+            --OPTICAL_DUPLICATE_PIXEL_DISTANCE 2500 \
+            --ASSUME_SORT_ORDER "queryname" \
+            --CREATE_MD5_FILE true
+        update_checkpoint "${sample_name}" "marked_duplicates"
+    fi
+
+    # Sort and fix tags
+    echo "Sort and fix step"
+    if [[ "$current_checkpoint" == "merged_bam_alignment" || "$current_checkpoint" == "aligned_"* || "$current_checkpoint" == "start" ]]; then
+        log_message "${sample_name}" "Starting sorting step"
+        java -Dsamjdk.compression_level=5 -Xmx7G -jar ${PICARD_PATH} \
+            SortSam \
+            --INPUT "${base_filename}aligned.unsorted.duplicate_marked.sorted.bam" \
+            --OUTPUT "${base_filename}aligned.duplicate_marked.sorted.bam" \
+            --SORT_ORDER "coordinate" \
+            --CREATE_INDEX false \
+            --CREATE_MD5_FILE false \
+            | \
+            java -Dsamjdk.compression_level=5 -Xmx1G -jar ${PICARD_PATH} \
+            SetNmMdAndUqTags \
+            --INPUT "${base_filename}aligned.duplicate_marked.sorted.bam" \
+            --OUTPUT "${base_filename}aligned.sorted.duplicate_unmarked.bam" \
+            --CREATE_INDEX true \
+            --CREATE_MD5_FILE true \
+            --REFERENCE_SEQUENCE ${REF_FASTA}
+        update_checkpoint "${sample_name}" "sorted_fixed_tags"
+    fi
+    
+
+    # Base recalibration
+    echo "BaseRecalibration step"
+    if [[ "$current_checkpoint" == "sorted_fixed_tags" || "$current_checkpoint" == "marked_duplicates" || "$current_checkpoint" == "aligned_"* || "$current_checkpoint" == "start" ]]; then
+        log_message "${sample_name}" "Starting base recalibration step"
+        ${GATK_PATH} --java-options "-Xmx4G" \
+            BaseRecalibrator \
+            -R ${REF_FASTA} \
+            -I "${base_filename}aligned.sorted.duplicate_marked.bam" \
+            --use-original-qualities \
+            -O "${base_filename}recal_data.csv" \
+            --known-sites ${DBSNP_VCF} \
+            --known-sites ${KNOWN_INDELS_SITES_VCF}
+        update_checkpoint "${sample_name}" "recalibrated"
+    fi
+    
+    # Apply BQSR
+    echo "BQSR step"
+    if [[ "$current_checkpoint" == "recalibrated" || "$current_checkpoint" == "sorted_fixed_tags" || "$current_checkpoint" == "marked_duplicates" || "$current_checkpoint" == "aligned_"* || "$current_checkpoint" == "start" ]]; then
+        log_message "${sample_name}" "Starting BQSR"
+        ${GATK_PATH} --java-options "-Xmx3G" \
+            ApplyBQSR \
+            -R ${REF_FASTA} \
+            -I "${base_filename}aligned.duplicate_marked.sorted.bam" \
+            -O "${base_filename}aligned.duplicate_marked.recalibrated.bam" \
+            -bqsr "${base_filename}recal_data.csv" \
+            --static-quantized-quals 10 \
+            --static-quantized-quals 20 \
+            --static-quantized-quals 30 \
+            --add-output-sam-program-record \
+            --create-output-bam-md5 \
+            --use-original-qualities
+        update_checkpoint "${sample_name}" "completed"
+    fi
+    
+        # Clean up intermediate files if processing completed successfully
+    if [[ "$current_checkpoint" == "completed" ]]; then
+        rm -f "${base_filename}aligned.unsorted.duplicates_unmarked.bam"
+        rm -f "${base_filename}aligned.sorted.duplicates_unmarked.bam"
+        rm -f "${base_filename}aligned.duplicate_unmarked.sorted.bam"
+        rm -f "${base_filename}aligned.duplicate_marked.sorted.bam"
+        rm -f "${base_filename}aligned.duplicate_marked.sorted.bai"
+        rm -f "${base_filename}aligned.duplicate_marked.sorted.bam.md5"
+        rm -f "${checkpoint_file}"
+    fi
+}
+
+# Main execution
+main() {
+    printf '%s\n' "${SAMPLE_NAMES[@]}" | parallel --jobs 80% process_sample {}
+}
+
+export -f handle_error
+export -f log_message
+export -f update_checkpoint
+export -f process_sample
+
+# Function to show usage
+usage() {
+    echo "Usage: $0 [options]"
+    echo
+    echo "Required arguments:"
+    echo "  -s sample1 [sample2 sample3 ...]   Specify one or more sample names"
+    echo "  -r REF_NAME                        Reference name"
+    echo "  -f REF_FASTA                       Reference FASTA file"
+    echo "  -i REF_FASTA_INDEX                 Reference FASTA index file"
+    echo "  -d REF_DICT                        Reference dictionary file"
+    echo "  -v DBSNP_VCF                       dbSNP VCF file"
+    echo "  -x DBSNP_VCF_INDEX                 dbSNP VCF index file"
+    echo "  -b UNMAPPED_BAM_LIST               List of unmapped BAM files"
+    echo "  -u UNMAPPED_BAM_SUFFIX             Suffix for unmapped BAM files"
+    echo "  -k KNOWN_INDELS_SITES_VCF          VCF file with known indels sites"
+    echo
+    echo "Optional arguments:"
+    echo "  -h                                 Display this help message"
+    echo
+    exit 1
+}
+
+# Parse command line arguments
+declare -a SAMPLE_NAMES
+while getopts ":s:q:r:f:i:d:v:x:b:u:k:h:" opt; do
+    case $opt in
+        s) 
+            # Handle multiple sample names
+            for sample in ${OPTARG}; do
+                SAMPLE_NAMES+=("$sample")
+            done
+            ;;
+        q) 
+            # Handle multiple sample fastqs
+            for sample_fqs in ${OPTARG}; do
+                SAMPLE_FQS+=("$sample_fqs")
+            done
+            ;;
+        r) REF_NAME="$OPTARG" ;;
+        f) REF_FASTA="$OPTARG" ;;
+        i) REF_FASTA_INDEX="$OPTARG" ;;
+        d) REF_DICT="$OPTARG" ;;
+        v) DBSNP_VCF="$OPTARG" ;;
+        x) DBSNP_VCF_INDEX="$OPTARG" ;;
+        b) UNMAPPED_BAM_LIST="$OPTARG" ;;
+        u) UNMAPPED_BAM_SUFFIX="$OPTARG" ;;
+        k) KNOWN_INDELS_SITES_VCF="$OPTARG" ;;
+        h) usage ;;  # Display usage if -h is passed
+        \?) echo "Invalid option: -$OPTARG" >&2; usage ;;
+        :) echo "Option -$OPTARG requires an argument." >&2; usage ;;
+    esac
+done
+
+# Check if at least one sample name is provided
+if [ ${#SAMPLE_NAMES[@]} -eq 0 ]; then
+    echo "Error: At least one sample name must be provided with -s flag"
+    usage
+fi
+
+# Check other required arguments
+required_args=("REF_NAME" "REF_FASTA" "REF_FASTA_INDEX" "REF_DICT" 
+              "DBSNP_VCF" "DBSNP_VCF_INDEX" "UNMAPPED_BAM_LIST" 
+              "UNMAPPED_BAM_SUFFIX" "KNOWN_INDELS_SITES_VCF")
+
+for arg in "${required_args[@]}"; do
+    if [[ -z "${!arg}" ]]; then
+        echo "Error: Required argument $arg is not set"
+        usage
+    fi
+done
+
+# Configuration variables
+GATK_PATH="./gatk/gatk"
+BWAKIT_PATH="./bwa.kit"
+PICARD_PATH="./build/libs/picard.jar"
+COMPRESSION_LEVEL=5
+
+# Execute main workflow at the very end
+main "$@"
