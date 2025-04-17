@@ -1,7 +1,7 @@
 # Processing Multi-omic data generated utilizing SeqWell S3
 Workflow scripts for data processing of multi-omics data generated using Seq-Well S3 and analysis scripts for downstream data analysis as presented in _A scalable, low-cost, sample hashing workflow for multi-omic single-cell analysis using the Seq-Well S3 platform_
 Data pre-processing wrappers should be run prior to analysis scripts to ensure all necessary files are available. 
-
+![alt text](https://github.com/ShalekLab/MultiOmics_SeqWellS3/blob/main/Figure1_pipeline.jpeg)
 ## data_preprocessing_wrappers
 Wrapper scripts to aggregate and parallelize multi-step processes required to achieve analysis ready files of genetic hashing, antibody hashing, and cell surface protein quantifications. 
 
